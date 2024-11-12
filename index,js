@@ -1,0 +1,157 @@
+const { Client, IntentsBitField, EmbedBuilder } = require('discord.js');
+require('dotenv').config();
+
+const StatusFormatter = require('./StatusFormatter');
+const axios = require('axios');
+
+const client = new Client({ 
+    intents: IntentsBitField.Flags.GUILDS | IntentsBitField.Flags.GUILD_MESSAGES
+});
+
+class ApexStatusBot {
+    constructor() {
+        this.client = client;
+        this.statusMessage = null;
+        this.maxRetries = 3;
+        this.retryCount = 0;
+        this.isUpdating = false;
+
+        // Sequential startup with proper delays
+        this.client.on('ready', async () => {
+            console.log(`Logged in as ${this.client.user.tag}!`);
+            // Initial delay before first update
+            setTimeout(() => {
+                this.updateStatus();
+                this.startStatusUpdates();
+            }, 3000);
+        });
+
+        this.client.on('error', error => {
+            console.error('Discord client error:', error);
+        });
+
+        this.client.login(process.env.DISCORD_TOKEN);
+    }
+
+    async getStatusData() {
+        try {
+            console.log('Fetching server status data...');
+            
+            // Sequential API calls with delay to avoid rate limiting
+            const serverResponse = await axios.get('https://api.mozambiquehe.re/servers', {
+                headers: {
+                    'Authorization': process.env.APEX_API_KEY
+                },
+                timeout: 5000
+            });
+
+            // Wait 500ms between API calls
+            await new Promise(resolve => setTimeout(resolve, 500));
+
+            const predatorResponse = await axios.get('https://api.mozambiquehe.re/predator', {
+                headers: {
+                    'Authorization': process.env.APEX_API_KEY
+                },
+                timeout: 5000
+            });
+
+            if (serverResponse.status === 200 && serverResponse.data && predatorResponse.status === 200 && predatorResponse.data) {
+                console.log('Successfully fetched both server and predator data');
+                this.retryCount = 0;
+                return { server: serverResponse.data, predator: predatorResponse.data };
+            } else {
+                throw new Error('Invalid response from API');
+            }
+        } catch (error) {
+            console.error('Error fetching status:', error.response?.data || error.message);
+            
+            if (this.retryCount < this.maxRetries) {
+                this.retryCount++;
+                console.log(`Retrying... Attempt ${this.retryCount} of ${this.maxRetries}`);
+                await new Promise(resolve => setTimeout(resolve, 2000));
+                return this.getStatusData();
+            }
+
+            throw error;
+        }
+    }
+
+    async updateStatus() {
+        if (this.isUpdating) {
+            console.log('Update already in progress, skipping...');
+            return;
+        }
+
+        this.isUpdating = true;
+        try {
+            const { server: statusData, predator: predatorData } = await this.getStatusData();
+            if (!statusData) {
+                console.error('No status data received');
+                return;
+            }
+
+            const lastUpdatedTimestamp = Math.floor(Date.now() / 1000);
+            const embed = new EmbedBuilder()
+                .setColor(0x2F3136)
+                .setTitle('Current Apex Legends Server Status')
+                .addFields(
+                    { name: 'Announcements', value: 'Server status may not always be indicative of your ability to play.' },
+                    { name: 'Last Updated', value: `<t:${lastUpdatedTimestamp}:R>`, inline: false }
+                );
+
+            const formattedStatus = StatusFormatter.formatServerStatus(statusData, embed, predatorData);
+
+            if (this.statusMessage) {
+                // On successful update, remove any error messages and update the status
+                await this.statusMessage.edit({
+                    content: null, // This removes any error message text
+                    ...formattedStatus
+                });
+                console.log('Status updated successfully at:', new Date().toISOString());
+            } else {
+                this.statusMessage = await this.client.channels.fetch(process.env.CHANNEL_ID)
+                    .then(channel => channel.send(formattedStatus))
+                    .catch(error => {
+                        console.error('Error sending status message:', error);
+                    });
+            }
+        } catch (error) {
+            console.error('Error updating status:', error);
+            if (this.statusMessage) {
+                await this.statusMessage.edit({
+                    content: "⚠️ Error updating server status. Retrying in 1 minute...\n" +
+                            "If this persists, please check https://apexlegendsstatus.com/",
+                    embeds: this.statusMessage.embeds // Keep the existing embeds
+                }).catch(console.error);
+            }
+        } finally {
+            this.isUpdating = false;
+        }
+    }
+
+    startStatusUpdates() {
+        // Update status every 60 seconds
+        setInterval(() => this.updateStatus(), 60 * 1000);
+    }
+}
+
+// Create instance of the bot
+const apexStatusBot = new ApexStatusBot();
+
+// Handle process termination gracefully
+process.on('SIGINT', () => {
+    console.log('Received SIGINT. Performing cleanup...');
+    client.destroy();
+    process.exit(0);
+});
+
+process.on('SIGTERM', () => {
+    console.log('Received SIGTERM. Performing cleanup...');
+    client.destroy();
+    process.exit(0);
+});
+
+// Handle unhandled rejections
+process.on('unhandledRejection', (error) => {
+    console.error('Unhandled promise rejection:', error);
+});
